@@ -2,29 +2,56 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <assert.h>
+
 #include <sched.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <math.h>
 
 #include "filter.h"
 #include "signal.h"
 #include "timing.h"
 
-int num_threads;
-int num_procs;
+int num_procs, num_threads;
 pthread_t *tid;
 
 typedef struct {
-	int band;
+	int band_start;
+	int band_span;
 	double bandwidth;
-	int band_block;
 	int filter_order;
-	double* filter_coeffs;
-	signal* sig;
-	signal* output;
-	double* band_power;
+	double *filter_coeffs;
+	signal *sig;
+	signal *output;
+	double *band_power
 } thread_data;
+
+void* worker(void *arg)
+{
+		thread_data *argcast = (thread_data*)arg;
+		int band;
+    for (band=argcast->band_start;band < (argcast->band_start + argcast->band_span);band++) { 
+	// Make the filter
+	generate_band_pass(argcast->sig->Fs, 
+			   band*argcast->bandwidth+0.0001, // keep within limits
+			   (band+1)*argcast->bandwidth-0.0001,
+			   argcast->filter_order, 
+			   &(argcast->filter_coeffs[band*(argcast->filter_order+1)]));
+	hamming_window(argcast->filter_order,&(argcast->filter_coeffs[band*(argcast->filter_order+1)]));
+
+	// Convolve
+	convolve(argcast->sig->num_samples,
+		 argcast->sig->data,
+		 argcast->filter_order,
+		 &(argcast->filter_coeffs[band*(argcast->filter_order+1)]),
+		 (argcast->output[band])->data);
+
+	// Capture characteristics
+	argcast->band_power[band] = avg_power((argcast->output[band])->data, (argcast->output[band])->num_samples);
+	
+    }
+
+	pthread_exit(NULL);
+}
 
 void usage() 
 {
@@ -78,44 +105,15 @@ void remove_dc(double *data, int num)
   }
 }
 
-void *worker(void *arg) {
 
-	// Parse arguments
-	thread_data *argcast = (thread_data*) arg;
-
-	// Make the filter
-	int i;
-	for(i=(argcast->band); i==(argcast->band)+(argcast->band_block); i++) {}
-	generate_band_pass(argcast->sig->Fs, 
-			   (argcast->band)*((argcast->bandwidth)+0.0001), // keep within limits
-			   (argcast->band+1)*((argcast->bandwidth)-0.0001),
-			   (argcast->filter_order), 
-			   &(argcast->filter_coeffs[(argcast->band)*((argcast->filter_order)+1)]));
-	hamming_window((argcast->filter_order),&(argcast->filter_coeffs[(argcast->band)*((argcast->filter_order)+1)]));
-
-	// Convolve
-	convolve(argcast->sig->num_samples,
-		 argcast->sig->data,
-		 argcast->filter_order,
-		 &(argcast->filter_coeffs[(argcast->band)*((argcast->filter_order)+1)]),
-		 argcast->output->data);
-
-	// Capture characteristics
-	(argcast->band_power[argcast->band]) = avg_power(argcast->output->data, argcast->output->num_samples);
-
-	pthread_exit(NULL);
-
-}
-
-int analyze_signal(signal *sig, int filter_order, int num_bands, double *lb, double *ub, int num_procs, int num_threads)
+int analyze_signal(signal *sig, int filter_order, int num_bands, int num_procs, int num_threads, double *lb, double *ub)
 {
     double Fc, bandwidth;
     double filter_coeffs[(filter_order+1)*num_bands];
     double signal_power;
     double band_power[num_bands];
-	signal *output[num_bands];
-	long tc;
-	long rc;
+    signal *output[num_bands];
+		long rc;
 
     double start, end;
     
@@ -123,23 +121,16 @@ int analyze_signal(signal *sig, int filter_order, int num_bands, double *lb, dou
     
     resources rstart, rend, rdiff;
     
-    tid = (pthread_t *) malloc(sizeof(pthread_t)*num_threads);
-
-    if (!tid) {
-    fprintf(stderr, "cannot allocate memory\n");
-    exit(-1);
-    }
+    int band;
 
     Fc=(sig->Fs)/2;
     bandwidth = Fc / num_bands;
+		int i;
+    for (i=0;i<num_bands;i++) output[i] = allocate_signal(sig->num_samples, sig->Fs, 0);
 
-    int i;
-    for(i=0; i<num_bands; i++) {
-    	output[i] = allocate_signal(sig->num_samples, sig->Fs, 0);
-	    if (!output[i]) { 
-		printf("Out of memory\n");
-		return 0;
-	    }
+    if (!output) { 
+	printf("Out of memory\n");
+	return 0;
     }
 
     remove_dc(sig->data,sig->num_samples);
@@ -151,35 +142,21 @@ int analyze_signal(signal *sig, int filter_order, int num_bands, double *lb, dou
     get_resources(&rstart,THIS_PROCESS);
     start=get_seconds();
     tstart = get_cycle_count();
+		
+		int thread_count = (num_threads < num_bands) ? num_threads : num_bands;
+		int tc, band_block = (num_threads < num_bands) ? ceil(num_bands/num_threads): 1;
+		for (tc=0; tc<thread_count; tc++) {
+			if(tc==thread_count-1) { band_block = num_bands - band_block*tc; }
+			thread_data td = {tc*band_block, band_block, bandwidth,filter_order,filter_coeffs,sig,output,band_power};
+			rc = pthread_create(&(tid[tc]), NULL, worker, (void*)(&td));
+			
+			if(rc!=0) { perror("Failed to start thread"); exit(-1); }
+		}
 
-    int thread_count = (num_threads < num_bands) ? num_threads : num_bands;
-    int band_block = (num_threads < num_bands) ? ceil(num_bands/num_threads): 1;
-    int band;
-	for (band=0;band<thread_count;band++) {
-	if (band == thread_count-1) {
-		band_block = num_bands - (band_block * band);
-	}
-	thread_data datas = {band, bandwidth, band_block, filter_order, &(filter_coeffs[(filter_order+1)*band*band_block]), sig, output[band], band_power};
-	rc=pthread_create( &(tid[band]), // thread id gets put here
-		       NULL,      // use default attributes
-		       worker,    // thread will begin in this function
-		       &datas  // we'll give it i as the argument
-	             );
-	if (rc!=0) { 
-	  perror("Failed to start thread");
-	  exit(-1);
-	}
-	}
-
-	// now we will join all the threads
-	for (band=0;band<num_threads;band++) {
-	rc=pthread_join(tid[band],NULL);   // 
-	if (rc!=0) { 
-	perror("join failed");
-	exit(-1);
-	}
-	}
-
+		for(tc=0; tc<thread_count; tc++) {
+			rc = pthread_join(tid[tc],NULL);
+			if(rc!=0) { perror("Join failed"); exit(-1); }
+		}
 
     tend = get_cycle_count();
     end = get_seconds();
@@ -190,6 +167,7 @@ int analyze_signal(signal *sig, int filter_order, int num_bands, double *lb, dou
     // Pretty print results
     double max_band_power = max_of(band_power,num_bands);
     double avg_band_power = avg_of(band_power,num_bands);
+    int i;
     int wow=0;
 
 #define MAXWIDTH 40
@@ -265,7 +243,7 @@ int main(int argc, char *argv[])
     int filter_order;
     int num_bands;
     double start, end;
-    
+
     if (argc!=6) { 
 	usage();
 	return -1;
@@ -276,27 +254,34 @@ int main(int argc, char *argv[])
     Fs = atof(argv[3]);
     filter_order = atoi(argv[4]);
     num_bands = atoi(argv[5]);
-    num_procs = atoi(argv[6]);
-    num_threads = atoi(argv[7]);
+		num_procs = atoi(argv[6]);
+		num_threads = atoi(argv[7]);
 
     assert(Fs>0.0);
     assert(filter_order>0 && !(filter_order & 0x1));
     assert(num_bands>0);
+		
+		tid = (pthread_t *) malloc(sizeof(pthread_t)*num_threads);
+		partial_sum = (double *) malloc(sizeof(double)*num_threads);
 
+		if (!tid) {
+		  fprintf(stderr, "cannot allocate memory\n");
+		  exit(-1);
+		}	
     printf("type:     %s\n"
 	   "file:     %s\n"
 	   "Fs:       %lf Hz\n"
 	   "order:    %d\n"
 	   "bands:    %d\n"
-	   "processes: %d\n"
-	   "threads: %d\n",
+		 "processes: %d\n"
+     "threads: %d\n",
 	   sig_type=='T' ? "Text" : sig_type=='B' ? "Binary" : sig_type=='M' ? "Mapped Binary" : "UNKNOWN TYPE",
 	   sig_file,
 	   Fs,
 	   filter_order,
 	   num_bands,
-	   num_procs,
-	   num_threads);
+		 num_procs,
+		 num_threads);
     
     printf("Load or map file\n");
     
@@ -318,14 +303,14 @@ int main(int argc, char *argv[])
 	    return -1;
     }
     
-	if (!sig) { 
+    if (!sig) { 
 	printf("Unable to load or map file\n");
 	return -1;
-	}
+    }
 
     sig->Fs=Fs;
 
-    if (analyze_signal(sig,filter_order,num_bands,&start,&end, num_procs, num_threads)) { 
+    if (analyze_signal(sig,filter_order,num_bands,num_procs,num_threads,&start,&end)) { 
 	printf("POSSIBLE ALIENS %lf-%lf HZ (CENTER %lf HZ)\n",start,end,(end+start)/2.0);
     } else {
 	printf("no aliens\n");
