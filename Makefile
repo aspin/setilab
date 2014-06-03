@@ -21,7 +21,7 @@ band_scan: band_scan.c filter.h signal.h timing.h libfilter.a
 	$(CC) band_scan.c -L. -lfilter -lm -o band_scan
 
 p_band_scan: p_band_scan.c filter.h signal.h timing.h libfilter.a
-	$(CC) p_band_scan.c -L. -lfilter -lm -o p_band_scan
+	$(CC) -pthread p_band_scan.c -O2 -L. -lfilter -lm -o p_band_scan
 
 #
 # Your rule for p_band_scan will look like the 
