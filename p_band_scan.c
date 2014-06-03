@@ -85,7 +85,7 @@ void *worker(void *arg) {
 
 	// Make the filter
 	int i;
-	for(i=(argcast->band); i=(argcast->band)+(argcast->band_block); i++) {}
+	for(i=(argcast->band); i==(argcast->band)+(argcast->band_block); i++) {}
 	generate_band_pass(argcast->sig->Fs, 
 			   (argcast->band)*((argcast->bandwidth)+0.0001), // keep within limits
 			   (argcast->band+1)*((argcast->bandwidth)-0.0001),
